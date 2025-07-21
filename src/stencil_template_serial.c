@@ -7,75 +7,84 @@
 
 #include "stencil_template_serial.h"
 
-
-int dump ( const double *, unsigned int [2], const char *, double *, double * );
-
-// ------------------------------------------------------------------
-// ------------------------------------------------------------------
-
 int main(int argc, char **argv)
 {
 
-  int  Niterations;
-  int  periodic;
-  unsigned int S[2];
+  int  Niterations; // how many iterations
+  int  periodic; // whether periodic boundaries apply
+  unsigned int S[2]; // size of the plate
 
-  int     Nsources;
-  int    *Sources;
-  double  energy_per_source;
+  int     Nsources; // how many heat sources
+  int    *Sources; // the heat sources
+  double  energy_per_source; // how much energy per source
 
-  double *planes[2];
+  double *planes[2]; // the two planes, old and new
   
-  double injected_heat = 0;
+  double injected_heat = 0; // how much energy has been injected in the system
 
-  int injection_frequency;
-  int output_energy_at_steps = 0;
+  int injection_frequency; // how often to inject energy
+  int output_energy_at_steps = 0; // whether to print the energy budget at every step
    
+  int ret; 
+
   /* argument checking and setting */
-  initialize ( argc, argv, &S[0], &periodic, &Niterations,
+  ret = initialize ( argc, argv, &S[0], &periodic, &Niterations,
 	       &Nsources, &Sources, &energy_per_source, &planes[0],
 	       &output_energy_at_steps, &injection_frequency );
-  
-  
+
+  if (ret == 1)
+  {
+    printf("Error during memory allocation\n");
+    return 1;
+  }
   int current = OLD;
+  double time_spent_injecting [Niterations];
+  double time_spent_updating [Niterations];
 
   if ( injection_frequency > 1 )
-    inject_energy( periodic, Nsources, Sources, energy_per_source, S, planes[current] );
-  
+    inject_energy( periodic, Nsources, Sources, energy_per_source, S, planes[current], &time_spent_injecting[0] );
+
   for (int iter = 0; iter < Niterations; iter++)
   {
-    /* new energy from sources */
 
+    /* new energy from sources */
     if ( iter % injection_frequency == 0 )
     {
-      inject_energy( periodic, Nsources, Sources, energy_per_source, S, planes[current] );
+      inject_energy( periodic, Nsources, Sources, energy_per_source, S, planes[current], &time_spent_injecting[iter] );
       injected_heat += Nsources*energy_per_source;
     }
                   
     /* update grid points */
-    update_plane(periodic, S, planes[current], planes[!current] );
+    update_plane(periodic, S, planes[current], planes[!current], &time_spent_updating[iter] );
 
     if ( output_energy_at_steps )
     {
       double system_heat;
       get_total_energy( S, planes[!current], &system_heat);
               
-      printf("step %d :: injected energy is %g, updated system energy is %g\n", iter, 
-      injected_heat, system_heat );
+      printf("step %d :: injected energy is %g, updated system energy is %g\n", 
+              iter, injected_heat, system_heat );
 
       char filename[100];
       sprintf( filename, "plane_%05d.bin", iter );
-      dump( planes[!current], S, filename, NULL, NULL );
-        
+      //dump( planes[!current], S, filename, NULL, NULL );        
     }
 
     /* swap planes for the new iteration */
       current = !current;
-      
   }
-  
+
+  double sumI = 0;
+  double sumU = 0; 
+  for(int i = 0; i < Niterations; i++)
+  {
+    sumI += time_spent_injecting[i]*1000;
+    sumU += time_spent_updating[i]*1000;
+  }
+  printf("Average time spent injecting energy: %f ms\n", sumI/Niterations);
+  printf("Average time spent updating: %f ms\n", sumU/Niterations);
+
   /* get final heat in the system */
-  
   double system_heat;
   get_total_energy( S, planes[current], &system_heat);
 
@@ -84,7 +93,6 @@ int main(int argc, char **argv)
   memory_release( planes[OLD], Sources );
   return 0;
 }
-
 
 /* ==========================================================================
    =                                                                        =
@@ -97,15 +105,6 @@ int main(int argc, char **argv)
    =                                                                        =
    =   initialization                                                       =
    ========================================================================== */
-
-
-
-int memory_allocate ( unsigned int [2],
-		                  double **);
-
-int initialize_sources( unsigned int [2],
-			                  int ,
-			                  int **);
 
 int initialize (int argc,                 // the argc from command line
                 char **argv,              // the argv from command line
@@ -202,23 +201,14 @@ int initialize (int argc,                 // the argc from command line
   }
 
   // ··································································
-  /*
-   * here we should check for all the parms being meaningful
-   *
-   */
-
-  // ...
-  
-
-  // ··································································
-  // allocae the needed memory
+  // allocate the needed memory
   //
-  ret = memory_allocate( S, planes );
+  ret = memory_allocate( S, planes ); 
   if ( ret != 0 )
     return ret;
 
   // ··································································
-  // allocae the heat sources
+  // allocate the heat sources
   //
   ret = initialize_sources( S, *Nsources, Sources );
   if ( ret != 0 )
