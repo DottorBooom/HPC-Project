@@ -40,12 +40,16 @@ int main(int argc, char **argv)
   int current = OLD;
   double time_spent_injecting [Niterations];
   double time_spent_updating [Niterations];
+  double time_spent_simulation [Niterations];
 
   if ( injection_frequency > 1 )
     inject_energy( periodic, Nsources, Sources, energy_per_source, S, planes[current], &time_spent_injecting[0] );
 
   for (int iter = 0; iter < Niterations; iter++)
   {
+
+    // Start timing
+    double start = omp_get_wtime();
 
     /* new energy from sources */
     if ( iter % injection_frequency == 0 )
@@ -72,17 +76,24 @@ int main(int argc, char **argv)
 
     /* swap planes for the new iteration */
       current = !current;
+
+    // End timing
+    time_spent_simulation[iter] = omp_get_wtime() - start;
   }
 
   double sumI = 0;
-  double sumU = 0; 
+  double sumU = 0;
+  double sumS = 0;
+  #pragma omp parallel for reduction(+:sumI, sumU, sumS) schedule(static)
   for(int i = 0; i < Niterations; i++)
   {
-    sumI += time_spent_injecting[i]*1000;
-    sumU += time_spent_updating[i]*1000;
+    sumI += time_spent_injecting[i];
+    sumU += time_spent_updating[i];
+    sumS += time_spent_simulation[i];
   }
-  printf("Average time spent injecting energy: %f ms\n", sumI/Niterations);
-  printf("Average time spent updating: %f ms\n", sumU/Niterations);
+  printf("Average time spent injecting energy: %f ms\n", (sumI/Niterations)*1000);
+  printf("Average time spent updating: %f ms\n", (sumU/Niterations)*1000);
+  printf("Total time spent in the simulation: %f s\n", sumS);
 
   /* get final heat in the system */
   double system_heat;
@@ -91,18 +102,19 @@ int main(int argc, char **argv)
   printf("injected energy is %g, system energy is %g\n", injected_heat, system_heat );
 
   memory_release( planes[OLD], Sources );
+
+  export_and_plot(time_spent_injecting, time_spent_updating, time_spent_simulation, Niterations);
+
   return 0;
 }
 
 /* ==========================================================================
-   =                                                                        =
    =   routines called within the integration loop                          =
    ========================================================================== */
 
 
 
 /* ==========================================================================
-   =                                                                        =
    =   initialization                                                       =
    ========================================================================== */
 
@@ -120,7 +132,6 @@ int initialize (int argc,                 // the argc from command line
 {
   int ret;
   
-  // ··································································
   // set default values
 
   S[_x_]            = 1000;
@@ -133,10 +144,9 @@ int initialize (int argc,                 // the argc from command line
   *injection_frequency = *Niterations;
 
   double freq = 0;
-  
-  // ··································································
-  // process the commadn line
-  // 
+
+  // process the command line
+
   while ( 1 )
   {
     int opt;
@@ -200,16 +210,12 @@ int initialize (int argc,                 // the argc from command line
     *injection_frequency = freq * *Niterations;
   }
 
-  // ··································································
   // allocate the needed memory
-  //
   ret = memory_allocate( S, planes ); 
   if ( ret != 0 )
     return ret;
 
-  // ··································································
   // allocate the heat sources
-  //
   ret = initialize_sources( S, *Nsources, Sources );
   if ( ret != 0 )
     return ret;
@@ -318,3 +324,38 @@ int dump ( const double *data, unsigned int size[2], const char *filename, doubl
 
   return 0;
 }
+
+/* ==========================================================================
+   =   Plot                                                                 =
+   ========================================================================== */
+
+void export_and_plot(double *injecting, double *updating, double *simulation, int Niterations) {
+    FILE *fp = fopen("timing_data.csv", "w");
+    fprintf(fp, "iteration,injecting,updating,simulation,total\n");
+
+    double accI = 0.0, accU = 0.0, accS = 0.0;
+    for (int i = 0; i < Niterations; i++) {
+        accI += injecting[i];
+        accU += updating[i];
+        accS += simulation[i];
+        fprintf(fp, "%d,%.8f,%.8f,%.8f\n", i, accI, accU, accS);
+    }
+    fclose(fp);
+
+    FILE *gp = fopen("plot.gp", "w");
+    fprintf(gp,
+        "set datafile separator \",\"\n"
+        "set title \"Cumulative Execution Time\"\n"
+        "set xlabel \"Iteration\"\n"
+        "set ylabel \"Cumulative Time (s)\"\n"
+        "set grid\n"
+        "set key outside\n"
+        "plot \"timing_data.csv\" using 1:2 with lines lw 2 title \"Injecting\", \\\n"
+        "     \"timing_data.csv\" using 1:3 with lines lw 2 title \"Updating\", \\\n"
+        "     \"timing_data.csv\" using 1:4 with lines lw 2 title \"Total\"\n"
+        "pause -1 \"Press Enter to close\"\n");
+    fclose(gp);
+
+    system("gnuplot plot.gp");
+}
+

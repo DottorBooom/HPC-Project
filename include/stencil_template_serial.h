@@ -12,6 +12,7 @@
 #include <time.h>
 #include <float.h>
 #include <math.h>
+#include <omp.h>
 
 #define NORTH 0
 #define SOUTH 1
@@ -28,7 +29,6 @@
 #define _y_ 1
 
 // ============================================================
-//
 // function prototypes
 
 int initialize (int,
@@ -52,13 +52,13 @@ extern int inject_energy (  int,
                             double,
                             unsigned int [2],
                             double *,
-                            double *);
+                            double *); // Timestamp
 
 extern int update_plane (   int,
                             unsigned int [2],
                             double *,
 		                    double *,
-                            double *);
+                            double *); //Timestamp
 
 extern int get_total_energy( unsigned int [2],
                              double *,
@@ -78,8 +78,9 @@ int initialize_sources( unsigned int [2],
 			                  int ,
 			                  int **);
 
+void export_and_plot(double *, double *, double *,int);
+
 // ============================================================
-// 
 // function definition for inline functions
 
 inline int inject_energy (  int periodic,
@@ -94,7 +95,8 @@ inline int inject_energy (  int periodic,
     #define IDX( i, j ) ( (j)*(mysize[_x_]+2) + (i) )
     
     // Start timing
-    clock_t begin = clock();
+    double begin = omp_get_wtime();
+    #pragma omp parallel for schedule(static)
     for (int s = 0; s < Nsources; s++) {
         
         unsigned x = Sources[2*s];
@@ -114,8 +116,8 @@ inline int inject_energy (  int periodic,
             }
     }
     // End timing
-    clock_t end = clock();
-    *time_spent = (double)(end - begin) / CLOCKS_PER_SEC;
+    double end = omp_get_wtime();
+    *time_spent = end - begin;
     //printf("Time spent injecting energy: %f seconds\n", *time_spent);
 
     #undef IDX
@@ -143,7 +145,7 @@ inline int update_plane (   int periodic,
     register const unsigned xsize = size[_x_];
     register const unsigned ysize = size[_y_];
 
-   #define IDX( i, j ) ( (j)*fxsize + (i) )
+    #define IDX( i, j ) ( (j)*fxsize + (i) )
 
     // HINT: you may attempt to
     //       (i)  manually unroll the loop
@@ -155,8 +157,9 @@ inline int update_plane (   int periodic,
     //       for openmp parallelization
 
     // Start timing
-    
-    clock_t begin = clock();
+    double begin = omp_get_wtime();
+
+    #pragma omp parallel for collapse(2) schedule(static)
     for (unsigned int j = 1; j <= ysize; j++)
         for (unsigned int i = 1; i <= xsize; i++)
         {
@@ -166,13 +169,11 @@ inline int update_plane (   int periodic,
             // alpha here mimics how much "easily" the heat
             // travels
             
-            
             double alpha = 0.6;
             double result = old[ IDX(i,j) ] *alpha;
             double sum_i  = (old[IDX(i-1, j)] + old[IDX(i+1, j)]) / 4.0 * (1-alpha);
             double sum_j  = (old[IDX(i, j-1)] + old[IDX(i, j+1)]) / 4.0 * (1-alpha);
             result += (sum_i + sum_j );
-            
             
             // implentation from the derivation of
             // 3-points 2nd order derivatives
@@ -208,8 +209,8 @@ inline int update_plane (   int periodic,
         }
     
     // End timing
-    clock_t end = clock();
-    *time_spent = (double)(end - begin) / CLOCKS_PER_SEC;
+    double end = omp_get_wtime();
+    *time_spent = end - begin;
     //printf("Time spent updating: %f seconds\n", (double)(end - begin) / CLOCKS_PER_SEC);
         
     if ( periodic )
@@ -219,11 +220,13 @@ inline int update_plane (   int periodic,
     * NOTE: when is that needed in distributed memory, if any?
     */
     {
+        // Vertical boundaries top <-> bottom
         for (unsigned int i = 1; i <= xsize; i++ )
             {
                 new[ i ] = new[ IDX(i, ysize) ];
                 new[ IDX(i, ysize+1) ] = new[ i ];
             }
+        // Horizontal boundaries left <-> right
         for (unsigned int j = 1; j <= ysize; j++ )
             {
                 new[ IDX( 0, j) ] = new[ IDX(xsize, j) ];
@@ -245,24 +248,26 @@ inline int get_total_energy(unsigned int size[2],
 {
     register const int xsize = size[_x_];
     
-   #define IDX( i, j ) ( (j)*(xsize+2) + (i) )
+    #define IDX( i, j ) ( (j)*(xsize+2) + (i) )
 
-   #if defined(LONG_ACCURACY)    
-    long double totenergy = 0;
-   #else
-    double totenergy = 0;    
-   #endif
+    #if defined(LONG_ACCURACY)    
+        long double totenergy = 0;
+    #else
+        double totenergy = 0;    
+    #endif
 
     // HINT: you may attempt to
     //       (i)  manually unroll the loop
     //       (ii) ask the compiler to do it
     // for instance
     // #pragma GCC unroll 4
+
+    #pragma omp parallel for collapse(2) reduction(+:totenergy) schedule(static)
     for (unsigned int j = 1; j <= size[_y_]; j++ )
         for (unsigned int i = 1; i <= size[_x_]; i++ )
             totenergy += plane[ IDX(i, j) ];
     
-   #undef IDX
+    #undef IDX
 
     *energy = (double)totenergy;
     return 0;
