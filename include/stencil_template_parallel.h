@@ -1,7 +1,5 @@
 /* -*- Mode: C; c-basic-offset:4 ; indent-tabs-mode:nil ; -*- */
-/*
- * See COPYRIGHT in top-level directory.
- */
+/* See COPYRIGHT in top-level directory. */
 
 
 #include <stdlib.h>
@@ -14,7 +12,6 @@
 
 #include <omp.h>
 #include <mpi.h>
-
 
 #define NORTH 0
 #define SOUTH 1
@@ -36,66 +33,72 @@ typedef uint    vec2_t[2];
 typedef double *restrict buffers_t[4];
 
 typedef struct {
-    double   * restrict data;
-    vec2_t     size;
+    double *restrict data;
+    vec2_t size;
 } plane_t;
 
+extern int inject_energy (const int,
+                          const int,
+			              const vec2_t *,
+			              const double,
+                          plane_t *,
+                          const vec2_t);
 
+extern int update_plane (const int,
+                         const vec2_t,
+                         const plane_t *,
+                         plane_t *);
 
-extern int inject_energy ( const int      ,
-                           const int      ,
-			   const vec2_t  *,
-			   const double   ,
-                                 plane_t *,
-                           const vec2_t   );
+extern int get_total_energy(plane_t *,
+                            double *);
 
+int initialize (MPI_Comm *,
+                int,
+                int,
+                int,
+                char **,
+                vec2_t *,
+                vec2_t *,
+                int *,
+                int *,
+                int *,
+                int *,
+                int *,
+                vec2_t **,
+                double *,
+                plane_t *,
+                buffers_t * );
 
-extern int update_plane ( const int      ,
-                          const vec2_t   ,
-                          const plane_t *,
-                                plane_t * );
+int memory_release (plane_t *planes,
+		            buffers_t *buffers);
 
-
-extern int get_total_energy( plane_t *,
-                             double  * );
-
-int initialize ( MPI_Comm *,
-                 int       ,
-		 int       ,
-		 int       ,
-		 char    **,
-                 vec2_t   *,
-                 vec2_t   *,                 
-		 int      *,
-                 int      *,
-		 int      *,
-		 int      *,
-		 int      *,
-		 int      *,
-                 vec2_t  **,
-                 double   *,
-                 plane_t  *,
-                 buffers_t * );
-
-
-int memory_release (plane_t   * );
-
-
-int output_energy_stat ( int      ,
+int output_energy_stat ( int,
                          plane_t *,
-                         double   ,
-                         int      ,
+                         double,
+                         int,
                          MPI_Comm *);
 
+uint simple_factorization(uint, int *, uint **);
 
+int initialize_sources(int,
+                       int,
+                       MPI_Comm *,
+                       uint [2],
+                       int,
+                       int *,
+                       vec2_t  **);
 
-inline int inject_energy ( const int      periodic,
-                           const int      Nsources,
-			   const vec2_t  *Sources,
-			   const double   energy,
-                                 plane_t *plane,
-                           const vec2_t   N
-                           )
+int memory_allocate (const int *,
+		            const vec2_t,
+		            buffers_t *,
+		            plane_t *);
+
+inline int inject_energy (const int periodic,
+                          const int Nsources,
+			              const vec2_t *Sources,
+			              const double   energy,
+                          plane_t *plane,
+                          const vec2_t   N)
 {
     const uint register sizex = plane->size[_x_]+2;
     double * restrict data = plane->data;
