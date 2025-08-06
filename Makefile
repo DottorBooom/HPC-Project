@@ -25,7 +25,7 @@ EXEC_SERIAL_NO_OMP = stencil_serial_nomp
 EXEC_PARALLEL    = stencil_parallel
 
 # Default target
-all: $(EXEC_SERIAL) $(EXEC_SERIAL_NO_OMP) #$(EXEC_PARALLEL) # Build both serial and parallel versions
+all: $(EXEC_SERIAL) $(EXEC_SERIAL_NO_OMP) $(EXEC_PARALLEL) # Build both serial and parallel versions
 
 # =================== SERIAL WITH OPENMP ===================
 $(EXEC_SERIAL): $(OBJ_SERIAL)
@@ -40,6 +40,13 @@ $(EXEC_SERIAL_NO_OMP): $(OBJ_SERIAL_NO_OMP)
 
 $(OBJ_SERIAL_NO_OMP): $(SRC_SERIAL_NO_OMP)
 	$(CC) $(CFLAGS) -c $< -o $@
+
+# =================== PARALLEL WITH MPI+OPENMP ===================
+$(EXEC_PARALLEL): $(OBJ_PARALLEL)
+	$(MPI_CC) $(CFLAGS) $(OMPFLAG) -o $@ $^
+
+$(OBJ_PARALLEL): $(SRC_PARALLEL)
+	$(MPI_CC) $(CFLAGS) $(OMPFLAG) -c $< -o $@
 
 # Clean target
 clean:

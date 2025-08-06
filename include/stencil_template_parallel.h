@@ -64,6 +64,7 @@ int initialize (MPI_Comm *,
                 int *,
                 int *,
                 int *,
+                int *,
                 vec2_t **,
                 double *,
                 plane_t *,
@@ -89,66 +90,55 @@ int initialize_sources(int,
                        vec2_t  **);
 
 int memory_allocate (const int *,
-		            const vec2_t,
 		            buffers_t *,
 		            plane_t *);
 
 inline int inject_energy (const int periodic,
                           const int Nsources,
 			              const vec2_t *Sources,
-			              const double   energy,
+			              const double energy,
                           plane_t *plane,
-                          const vec2_t   N)
+                          const vec2_t N)
 {
-    const uint register sizex = plane->size[_x_]+2;
     double * restrict data = plane->data;
-    
-   #define IDX( i, j ) ( (j)*sizex + (i) )
+
+    #define IDX(i, j) ((j) * (plane->size[_x_] + 4) + (i) - 8)
     for (int s = 0; s < Nsources; s++)
+    {
+        int x = Sources[s][_x_];
+        int y = Sources[s][_y_];
+        
+        data[IDX(x,y)] += energy;
+        
+        if (periodic)
         {
-            int x = Sources[s][_x_];
-            int y = Sources[s][_y_];
-            
-            data[ IDX(x,y) ] += energy;
-            
-            if ( periodic )
-                {
-                    if ( (N[_x_] == 1)  )
-                        {
-                            // propagate the boundaries if needed
-                            // check the serial version
-                        }
-                    
-                    if ( (N[_y_] == 1) )
-                        {
-                            // propagate the boundaries if needed
-                            // check the serial version
-                        }
-                }                
-        }
- #undef IDX
-    
-  return 0;
+            if ((N[_x_] == 1))
+            {
+                data[IDX(N[_x_]+1, y)] += energy;
+            }
+
+            if ((N[_y_] == 1))
+            {
+                data[IDX(x, N[_y_]+1)] += energy;
+            }
+        }                
+    }
+    #undef IDX
+    return 0;
 }
 
-
-
-
-
-inline int update_plane ( const int      periodic, 
-                          const vec2_t   N,         // the grid of MPI tasks
+inline int update_plane ( const int periodic, 
+                          const vec2_t N,         // the grid of MPI tasks
                           const plane_t *oldplane,
-                                plane_t *newplane
-                          )
-    
+                          plane_t *newplane)
 {
-    uint register fxsize = oldplane->size[_x_]+2;
-    uint register fysize = oldplane->size[_y_]+2;
-    
-    uint register xsize = oldplane->size[_x_];
-    uint register ysize = oldplane->size[_y_];
-    
-   #define IDX( i, j ) ( (j)*fxsize + (i) )
+    register uint fxsize = oldplane->size[_x_]+2;
+    //register uint fysize = oldplane->size[_y_]+2;
+
+    register uint xsize = oldplane->size[_x_];
+    register uint ysize = oldplane->size[_y_];
+
+    #define IDX( i, j ) ( (j)*fxsize + (i) )
     
     // HINT: you may attempt to
     //       (i)  manually unroll the loop
@@ -162,44 +152,56 @@ inline int update_plane ( const int      periodic,
     double * restrict old = oldplane->data;
     double * restrict new = newplane->data;
     
-    for (uint j = 1; j <= ysize; j++)
-        for ( uint i = 1; i <= xsize; i++)
-            {
-                
-                // NOTE: (i-1,j), (i+1,j), (i,j-1) and (i,j+1) always exist even
-                //       if this patch is at some border without periodic conditions;
-                //       in that case it is assumed that the +-1 points are outside the
-                //       plate and always have a value of 0, i.e. they are an
-                //       "infinite sink" of heat
-                
-                // five-points stencil formula
-                //
-                // HINT : check the serial version for some optimization
-                //
-                new[ IDX(i,j) ] =
-                    old[ IDX(i,j) ] / 2.0 + ( old[IDX(i-1, j)] + old[IDX(i+1, j)] +
-                                              old[IDX(i, j-1)] + old[IDX(i, j+1)] ) /4.0 / 2.0;
-                
-            }
+    #pragma omp parallel
+    {
+        //int tid = omp_get_thread_num();
+        //double t_start = omp_get_wtime();
 
-    if ( periodic )
-        {
-            if ( N[_x_] == 1 )
-                {
-                    // propagate the boundaries as needed
-                    // check the serial version
-                }
-  
-            if ( N[_y_] == 1 ) 
-                {
-                    // propagate the boundaries as needed
-                    // check the serial version
-                }
+        // Select schedule policy via preprocessor
+#if OPENMP_SCHEDULE == SCHED_STATIC
+    #pragma omp for schedule(static) nowait
+#elif OPENMP_SCHEDULE == SCHED_DYNAMIC
+    #pragma omp for schedule(dynamic, OMP_CHUNK_SIZE) nowait
+#elif OPENMP_SCHEDULE == SCHED_GUIDED
+    #pragma omp for schedule(guided, OMP_CHUNK_SIZE) nowait
+#else  // AUTO or fallback
+    #pragma omp for schedule(auto) nowait
+#endif
+        
+        /* #pragma omp for schedule(static) nowait */
+        for (uint j = 1; j <= ysize; j++) {
+            for (uint i = 1; i <= xsize; i++) 
+            {
+                double alpha = 0.6;
+                double result = old[IDX(i,j)] * alpha;
+                double sum_i = (old[IDX(i-1, j)] + old[IDX(i+1, j)]) / 4.0 * (1 - alpha);
+                double sum_j = (old[IDX(i, j-1)] + old[IDX(i, j+1)]) / 4.0 * (1 - alpha);
+                result += (sum_i + sum_j);
+                new[IDX(i,j)] = result;
+            }
         }
 
-    
- #undef IDX
-  return 0;
+        //double t_end = omp_get_wtime();
+        //thread_times[1][tid] += (t_end - t_start);
+    }
+
+    if (periodic) {
+        if (N[_x_] == 1) {
+            for (uint i = 1; i <= xsize; i++) {
+                new[i] = new[IDX(i, ysize)];
+                new[IDX(i, ysize+1)] = new[i];
+            }
+        }
+        if (N[_y_] == 1) {
+            for (uint j = 1; j <= ysize; j++) {
+                new[IDX(0, j)] = new[IDX(xsize, j)];
+                new[IDX(xsize+1, j)] = new[IDX(1, j)];
+            }
+        }
+    }
+
+    return 0;
+    #undef IDX
 }
 
 
@@ -212,9 +214,9 @@ inline int get_total_energy( plane_t *plane,
  */
 {
 
-    const int register xsize = plane->size[_x_];
-    const int register ysize = plane->size[_y_];
-    const int register fsize = xsize+2;
+    register const int xsize = plane->size[_x_];
+    register const int ysize = plane->size[_y_];
+    register const int fsize = xsize+2;
 
     double * restrict data = plane->data;
     
