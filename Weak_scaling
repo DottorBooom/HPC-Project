@@ -1,0 +1,538 @@
+#!/bin/bash
+
+# ============================================================================
+# SLURM Weak Scaling Benchmark Script for 2D Heat Diffusion Simulation
+# ============================================================================
+#
+# This script performs comprehensive weak scaling analysis on multiple 
+# implementations of the heat diffusion simulation. Weak scaling keeps 
+# the work per processing element constant while increasing both problem 
+# size and number of processing elements proportionally to measure scalability.
+#
+# IMPLEMENTATIONS TESTED (ordered by complexity):
+# 1. OpenMP (Shared Memory)      - stencil_serial (multi-threaded on single node)
+# 2. MPI-Only (Distributed)      - stencil_parallel_nomp (pure distributed memory)
+# 3. MPI+OpenMP Hybrid (Standard)- stencil_parallel (hybrid parallelization)
+# 4. MPI+OpenMP Optimized        - stencil_parallel_2 (communication-computation overlap)
+#
+# WEAK SCALING METHODOLOGY:
+# - Constant work per core: Base problem size (2048×2048) scales with √N processors
+# - Problem size grows proportionally: N cores → √N × base_size grid dimension
+# - Fixed computational intensity per core (1000 iterations, ~1000 sources)
+# - Ideal weak scaling maintains constant execution time regardless of core count
+# - Efficiency metric: Time(1 core) / Time(N cores) should remain ≈ 1.0
+#
+# SCALING APPROACH:
+# - 1 core:    2048 × 2048 grid     (base case)
+# - 4 cores:   4096 × 4096 grid     (2× linear dimension = 4× area)
+# - 16 cores:  8192 × 8192 grid     (4× linear dimension = 16× area)
+# - 64 cores:  16384 × 16384 grid   (8× linear dimension = 64× area)
+# - etc.
+#
+# PERFORMANCE METRICS COLLECTED:
+# - Execution times (total, initialization, computation, communication)
+# - Weak scaling efficiency (baseline_time / current_time)
+# - Load balancing metrics (imbalance, efficiency)
+# - Communication efficiency (for MPI versions)  
+# - Memory hierarchy performance (implicit through timing)
+#
+# OUTPUT FILES:
+# - weak_omp_slurm.csv           : OpenMP weak scaling results
+# - weak_mpi_slurm.csv           : MPI-only weak scaling results  
+# - weak_hybrid_slurm.csv        : Standard hybrid weak scaling results
+# - weak_hybrid_v2_slurm.csv     : Optimized hybrid weak scaling results
+#
+# USAGE: sbatch Weak_scaling
+#
+# ============================================================================
+
+#SBATCH --partition=EPYC
+#SBATCH --job-name=weak_scaling_test
+#SBATCH --output=weak_scaling_slurm_%j.out
+#SBATCH --error=weak_scaling_slurm_%j.err
+#SBATCH --nodes=1
+#SBATCH --exclusive
+#SBATCH --time=01:00:00
+#SBATCH --chdir=/u/ipauser/dmartinelli/Assignment
+
+module load openMPI/4.1.6
+
+# ============================================================================
+# WEAK SCALING TEST CONFIGURATION
+# ============================================================================
+#
+# Weak scaling methodology: Keep work per processing element CONSTANT while 
+# increasing both total problem size and processing elements proportionally.
+# This tests how well the algorithm maintains consistent performance per core
+# as the system scales up. Ideal weak scaling shows constant execution time.
+
+# Benchmark configuration parameters
+NUM_RUNS=3                           # Statistical reliability: multiple runs per configuration
+RESULTS_DIR="results/weak_scaling"   # Directory for CSV output files
+
+# CSV output files for different parallelization approaches
+OMP_CSV="$RESULTS_DIR/weak_omp_slurm.csv"        # OpenMP weak scaling results
+MPI_PURE_CSV="$RESULTS_DIR/weak_mpi_slurm.csv"   # MPI-only weak scaling results  
+MPI_HYBRID_CSV="$RESULTS_DIR/weak_hybrid_slurm.csv"     # Standard hybrid weak scaling results
+MPI_HYBRID_V2_CSV="$RESULTS_DIR/weak_hybrid_v2_slurm.csv"  # Optimized hybrid weak scaling results
+
+# Problem scaling parameters (PROPORTIONAL to processing elements)
+BASE_SIDE_LEN=$((2048))              # Base grid dimension for single core: 2048×2048
+ITERATIONS=1000                      # Time steps: Fixed for all configurations
+NSOURCES=1000                        # Heat sources: Fixed total (distributed across grid)
+ENERGY_PER_SOURCE=1.0               # Energy per source: 1.0 units
+PERIODIC_FLAG="-p 1"                # Enable periodic boundary conditions
+
+# Parallelization scaling configurations
+THREADS_LIST=(1 2 4 8 16 32 64 128)      # OpenMP thread counts (powers of 2)
+MPI_LIST_PURE=(1 2 4 8 16)              # MPI task counts for MPI-only version
+MPI_LIST=(1 2 4 8 16)                   # MPI task counts for hybrid versions  
+OMP_THREADS_PER_TASK=8                  # Fixed OpenMP threads per MPI task for hybrid
+
+# Weak scaling formula: Grid dimension = BASE_SIDE_LEN × √(cores)
+# This ensures area scales proportionally with core count (constant work per core)
+
+echo "==================================================="
+echo "SLURM Weak Scaling Benchmark - Heat Diffusion 2D"
+echo "==================================================="
+echo "Weak Scaling Configuration (PROPORTIONAL problem sizes):"
+echo "  Base grid size: ${BASE_SIDE_LEN} × ${BASE_SIDE_LEN} = $((BASE_SIDE_LEN * BASE_SIDE_LEN)) points (1 core)"
+echo "  Iterations: $ITERATIONS (fixed for all configurations)"
+echo "  Heat sources: $NSOURCES (fixed total, distributed across grid)"
+echo "  Energy per source: $ENERGY_PER_SOURCE"
+echo "  Boundary conditions: Periodic"
+echo ""
+echo "Scaling Formula: Grid_Size = Base_Size × √(Cores)"
+echo "  Example: 4 cores → $((BASE_SIDE_LEN * 2)) × $((BASE_SIDE_LEN * 2)) = $((BASE_SIDE_LEN * BASE_SIDE_LEN * 4)) points"
+echo ""
+echo "Parallelization Configurations:"
+echo "  OpenMP threads: ${THREADS_LIST[*]}"
+echo "  MPI tasks (pure): ${MPI_LIST_PURE[*]}"
+echo "  MPI tasks (hybrid): ${MPI_LIST[*]} (${OMP_THREADS_PER_TASK} threads/task)"
+echo "  Total runs per config: $NUM_RUNS"
+echo "==================================================="
+mkdir -p $RESULTS_DIR
+
+# ============================================================================
+# CSV OUTPUT FILE INITIALIZATION
+# ============================================================================
+#
+# Create CSV headers for each parallelization approach with comprehensive metrics:
+# - Performance metrics: Total time, weak scaling efficiency  
+# - Load balancing: Imbalance ratios and efficiency metrics  
+# - Communication analysis: Communication time, wait time, efficiency
+# - Problem size tracking: Grid dimensions for each core count
+
+echo "Run,Threads,ProblemSize,TotalTime,InitTime,ComputeTime,Overhead,Efficiency,LoadImbalance" > "$OMP_CSV"
+echo "Run,Tasks,ProblemSize,TotalTime,InitTime,ComputeTime,CommTime,WaitTime,Overhead,Efficiency,LoadImbalance,LoadBalanceEfficiency,CommEfficiency" > "$MPI_PURE_CSV"
+echo "Run,Tasks,ThreadsPerTask,ProblemSize,TotalTime,InitTime,ComputeTime,CommTime,WaitTime,Overhead,Efficiency,LoadImbalance,LoadBalanceEfficiency,CommEfficiency" > "$MPI_HYBRID_CSV"
+echo "Run,Tasks,ThreadsPerTask,ProblemSize,TotalTime,InitTime,ComputeTime,CommTime,WaitTime,Overhead,Efficiency,LoadImbalance,LoadBalanceEfficiency,CommEfficiency" > "$MPI_HYBRID_V2_CSV"
+
+# ============================================================================
+# EXECUTABLE VALIDATION AND COMPILATION
+# ============================================================================
+#
+# Rebuild all executables to ensure consistency with latest source code
+# Validate that all required executables exist before starting benchmarks
+
+echo "Rebuilding executables..."
+make clean > /dev/null
+make all > /dev/null
+
+# Validate executable names match Makefile targets (updated naming scheme)
+REQUIRED_EXECUTABLES=("stencil_serial" "stencil_parallel_nomp" "stencil_parallel" "stencil_parallel_2")
+MISSING_EXECUTABLES=()
+
+for exec in "${REQUIRED_EXECUTABLES[@]}"; do
+    if [ ! -f "$exec" ]; then
+        MISSING_EXECUTABLES+=("$exec")
+    fi
+done
+
+if [ ${#MISSING_EXECUTABLES[@]} -ne 0 ]; then
+    echo "ERROR: Compilation failed. Missing executables: ${MISSING_EXECUTABLES[*]}"
+    echo "Please check Makefile and source files."
+    exit 1
+fi
+
+echo "All executables validated successfully:"
+for exec in "${REQUIRED_EXECUTABLES[@]}"; do
+    echo "  ✓ $exec"
+done
+echo ""
+
+# Set environment variables for optimal performance
+export OMP_DISPLAY_AFFINITY=FALSE
+
+# ============================================================================
+# BENCHMARKING EXECUTION LOOP
+# ============================================================================
+#
+# Execute multiple runs of each parallelization approach for statistical reliability.
+# Each implementation is tested with proportionally increasing problem sizes to 
+# measure weak scaling effectiveness.
+
+for run in $(seq 1 $NUM_RUNS); do
+    echo "---------------------------------------------------"
+    echo "Benchmarking OPENMP version (Shared Memory) - Run #$run"
+    echo "---------------------------------------------------"
+
+    # OpenMP baseline time tracking for weak scaling efficiency calculations
+    OMP_SERIAL_TIME="" # Initialize baseline time for this run block
+    
+    for threads in "${THREADS_LIST[@]}"; do
+        # Scale side length by sqrt(threads) to keep area proportional to threads
+        # This maintains constant work per core for ideal weak scaling
+        NEW_SIDE=$(echo "sqrt($threads) * $BASE_SIDE_LEN" | bc -l)
+        X_SIZE=$(printf "%.0f" "$NEW_SIDE")
+        Y_SIZE=$X_SIZE
+        PROBLEM_SIZE="${X_SIZE}x${Y_SIZE}"
+        echo "Testing OpenMP with $threads threads on a $PROBLEM_SIZE grid..."
+
+        # Set the number of threads for this specific configuration
+        export OMP_NUM_THREADS="$threads"
+
+        # Execute OpenMP version with SLURM resource allocation
+        # Uses stencil_serial (OpenMP-enabled version from Makefile)
+        PAR_OUTPUT=$(srun --ntasks=1 --cpus-per-task="$threads" ./stencil_serial -x "$X_SIZE" -y "$Y_SIZE" -n $ITERATIONS -e $NSOURCES -E $ENERGY_PER_SOURCE $PERIODIC_FLAG)
+        
+        # Parse comprehensive performance metrics from program output
+        OMP_TOTAL=$(echo "$PAR_OUTPUT"   | awk '/^Total time:/ {print $3}')
+        OMP_INIT=$(echo "$PAR_OUTPUT" | awk '/^Initialization time:/ {print $3}')
+        OMP_COMP=$(echo "$PAR_OUTPUT" | awk '/^Computation time:/ {print $3}')
+        OMP_COMP_RATIO=$(echo "$PAR_OUTPUT" | awk -F'[ %]' '/^Computation\/Total ratio:/ {print $3}')
+        OMP_OVER_S=$(echo "$PAR_OUTPUT" | awk '/^Other time \(overhead\):/ {print $4}')
+        OMP_OVER_PCT=$(echo "$PAR_OUTPUT" | awk -F'[()% ]+' '/^Other time \(overhead\):/ {print $6}')
+        LOAD_IMBALANCE=$(echo "$PAR_OUTPUT" | awk '/Load imbalance/ {print $3}')
+
+        # Validate that all critical metrics were successfully parsed
+        if [[ -z "${OMP_TOTAL:-}" || -z "${OMP_INIT:-}" || -z "${OMP_COMP:-}" || -z "${OMP_COMP_RATIO:-}" || -z "${OMP_OVER_S:-}" || -z "${OMP_OVER_PCT:-}" || -z "${LOAD_IMBALANCE:-}" ]]; then
+            echo "Error: OpenMP run failed to produce valid performance metrics for $threads thread(s)." >&2
+            echo "Program output:"
+            echo "$PAR_OUTPUT"
+            continue
+        fi
+
+        # Establish baseline time from single-threaded execution (threads=1)
+        if [ "$threads" -eq 1 ]; then
+            OMP_SERIAL_TIME=$OMP_TOTAL
+            echo "Baseline time for OpenMP (1 thread): $OMP_SERIAL_TIME s"
+        fi
+
+        # Weak scaling efficiency = Time(1 core) / Time(N cores)
+        # Ideal weak scaling maintains efficiency ≈ 1.0 (constant time per core)
+        EFFICIENCY=$(echo "scale=4; $OMP_SERIAL_TIME / $OMP_TOTAL" | bc)
+
+        # Display comprehensive weak scaling performance summary
+        echo "OpenMP Configuration: $threads threads, problem size: $PROBLEM_SIZE"
+        echo "  Performance breakdown:"
+        echo "    Init:      $OMP_INIT s"
+        echo "    Compute:   $OMP_COMP s ($OMP_COMP_RATIO%)"
+        echo "    Overhead:  $OMP_OVER_S s (${OMP_OVER_PCT:-N/A}%)"
+        echo "    Total:     $OMP_TOTAL s"
+        echo "  Weak scaling metrics:"
+        echo "    Efficiency: $(echo "scale=2; $EFFICIENCY * 100" | bc)% (ideal = 100%)"
+        echo "    Load imbalance: $LOAD_IMBALANCE"
+        echo "---------------------------------------------------"
+
+        # Record comprehensive results to CSV file for analysis
+        echo "$run,$threads,$PROBLEM_SIZE,$OMP_TOTAL,$OMP_INIT,$OMP_COMP,$OMP_OVER_S,$EFFICIENCY,$LOAD_IMBALANCE" >> "$OMP_CSV"
+    done
+
+    echo "---------------------------------------------------"
+    echo "Benchmarking MPI-ONLY version (Distributed Memory) - Run #$run"
+    echo "---------------------------------------------------"
+
+    # MPI-only baseline time tracking for weak scaling efficiency calculations
+    MPI_SERIAL_TIME="" # Initialize baseline time for this block
+    for mpi in "${MPI_LIST_PURE[@]}"; do
+        # Scale side length by sqrt(total_cores) to keep area proportional
+        NEW_SIDE=$(echo "sqrt($mpi) * $BASE_SIDE_LEN" | bc -l)
+        X_SIZE=$(printf "%.0f" "$NEW_SIDE")
+        Y_SIZE=$X_SIZE
+        PROBLEM_SIZE="${X_SIZE}x${Y_SIZE}"
+        echo "Testing MPI-only with $mpi tasks on a $PROBLEM_SIZE grid..."
+
+        # Execute MPI-only version with SLURM resource allocation
+        # Uses stencil_parallel_nomp (MPI-only executable from Makefile)
+        MPI_OUTPUT=$(srun -n "$mpi" ./stencil_parallel_nomp -x "$X_SIZE" -y "$Y_SIZE" -n $ITERATIONS -e $NSOURCES -E $ENERGY_PER_SOURCE $PERIODIC_FLAG)
+
+        # Parse comprehensive MPI performance metrics
+        MPI_TOTAL=$(echo "$MPI_OUTPUT" | awk '/^Total time:/ {print $3}')
+        MPI_INIT=$(echo "$MPI_OUTPUT" | awk '/^Initialization time:/ {print $3}')
+        MPI_COMP=$(echo "$MPI_OUTPUT" | awk '/^Computation time:/ {print $3}')
+        MPI_COMM=$(echo "$MPI_OUTPUT" | awk '/^Communication time:/ {print $3}')
+        MPI_COMM_RATIO=$(echo "$MPI_OUTPUT" | awk -F'[ %]' '/^Communication\/Total ratio:/ {print $3}')
+        MPI_COMP_RATIO=$(echo "$MPI_OUTPUT" | awk -F'[ %]' '/^Computation\/Total ratio:/ {print $3}')
+        MPI_WAIT=$(echo "$MPI_OUTPUT" | awk '/^Wait time for communication:/ {print $5}')
+        MPI_OVER_S=$(echo "$MPI_OUTPUT" | awk '/^Other time \(overhead\):/ {print $4}')
+        MPI_OVER_PCT=$(echo "$MPI_OUTPUT" | awk -F'[()% ]+' '/^Other time \(overhead\):/ {print $6}')
+        LOAD_IMBALANCE=$(echo "$MPI_OUTPUT" | awk '/Load imbalance/ {print $3}')
+        LOAD_BALANCE_EFF=$(echo "$MPI_OUTPUT" | awk '/^Load balance efficiency:/ {print $4}')
+        COMM_EFFICIENCY=$(echo "$MPI_OUTPUT" | awk '/^Communication efficiency:/ {print $3}')
+
+        # Parse max values across all MPI ranks for load balancing analysis
+        MPI_MAX_TOTAL=$(echo "$MPI_OUTPUT" | awk '/^Max total time:/ {print $4}')
+        MPI_MAX_COMP=$(echo "$MPI_OUTPUT" | awk '/^Max computation time:/ {print $4}')
+        MPI_MAX_COMM=$(echo "$MPI_OUTPUT" | awk '/^Max communication time:/ {print $4}')
+        MPI_MAX_WAIT=$(echo "$MPI_OUTPUT" | awk '/^Max wait time for communication:/ {print $6}')
+
+        # Validate that all critical metrics were successfully parsed
+        if [[ -z "${MPI_TOTAL:-}" || -z "${MPI_INIT:-}" || -z "${MPI_COMP:-}" || -z "${MPI_COMM:-}" || -z "${MPI_COMM_RATIO:-}" || -z "${MPI_COMP_RATIO:-}" || -z "${MPI_WAIT:-}" || -z "${MPI_OVER_S:-}" || -z "${MPI_OVER_PCT:-}" || -z "${LOAD_IMBALANCE:-}" || -z "${LOAD_BALANCE_EFF:-}" || -z "${COMM_EFFICIENCY:-}" ]]; then
+            echo "Error: MPI-only run failed to produce valid performance metrics for $mpi task(s)." >&2
+            echo "Program output:"
+            echo "$MPI_OUTPUT"
+            continue
+        fi
+
+        # Establish baseline time from single-task execution (mpi=1)
+        if [ "$mpi" -eq 1 ]; then
+            MPI_SERIAL_TIME=$MPI_TOTAL
+            echo "Baseline time for MPI-only (1 task): $MPI_SERIAL_TIME s"
+        fi
+
+        # Weak scaling efficiency = Time(1 core) / Time(N cores)
+        # Ideal weak scaling maintains efficiency ≈ 1.0 (constant time per task)
+        EFFICIENCY=$(echo "scale=4; $MPI_SERIAL_TIME / $MPI_TOTAL" | bc)
+
+        # Display comprehensive MPI weak scaling performance analysis
+        echo "MPI-Only Configuration: $mpi tasks, problem size: $PROBLEM_SIZE"
+        echo "  Performance breakdown:"
+        echo "    Init:      $MPI_INIT s"
+        echo "    Compute:   $MPI_COMP s ($MPI_COMP_RATIO%)"
+        echo "    Comm:      $MPI_COMM s ($MPI_COMM_RATIO%)"
+        echo "    Wait:      $MPI_WAIT s"
+        echo "    Overhead:  $MPI_OVER_S s (${MPI_OVER_PCT:-N/A}%)"
+        echo "    Total:     $MPI_TOTAL s"
+        echo "  Max values across ranks:"
+        echo "    Max Total:   $MPI_MAX_TOTAL s"
+        echo "    Max Compute: $MPI_MAX_COMP s"
+        echo "    Max Comm:    $MPI_MAX_COMM s"
+        echo "    Max Wait:    $MPI_MAX_WAIT s"
+        echo "  Weak scaling metrics:"
+        echo "    Efficiency: $(echo "scale=2; $EFFICIENCY * 100" | bc)% (ideal = 100%)"
+        echo "    Load imbalance: $LOAD_IMBALANCE"
+        echo "    Load balance efficiency: $LOAD_BALANCE_EFF"
+        echo "    Communication efficiency: $COMM_EFFICIENCY"
+        echo "---------------------------------------------------"
+
+        # Record comprehensive results to CSV file for analysis
+        echo "$run,$mpi,$PROBLEM_SIZE,$MPI_TOTAL,$MPI_INIT,$MPI_COMP,$MPI_COMM,$MPI_WAIT,$MPI_OVER_S,$EFFICIENCY,$LOAD_IMBALANCE,$LOAD_BALANCE_EFF,$COMM_EFFICIENCY" >> "$MPI_PURE_CSV"
+    done
+
+    echo "---------------------------------------------------"
+    echo "Benchmarking MPI+OPENMP HYBRID version (Standard) - Run #$run"
+    echo "---------------------------------------------------"
+
+    # Standard MPI+OpenMP hybrid baseline time tracking for weak scaling efficiency calculations  
+    HYBRID_SERIAL_TIME="" # Initialize baseline time for this block
+    for mpi in "${MPI_LIST[@]}"; do
+        export OMP_NUM_THREADS=$OMP_THREADS_PER_TASK   # Fixed 8 OpenMP threads per MPI task
+
+        TOTAL_CORES=$((mpi * OMP_THREADS_PER_TASK))
+        # Scale side length by sqrt(total_cores) to keep area proportional
+        NEW_SIDE=$(echo "sqrt($TOTAL_CORES) * $BASE_SIDE_LEN" | bc -l)
+        X_SIZE=$(printf "%.0f" "$NEW_SIDE")
+        Y_SIZE=$X_SIZE
+        PROBLEM_SIZE="${X_SIZE}x${Y_SIZE}"
+        echo "Testing Standard Hybrid with $mpi tasks ($TOTAL_CORES total cores) on a $PROBLEM_SIZE grid..."
+
+        # Execute standard hybrid version with SLURM resource allocation
+        # Uses stencil_parallel (standard MPI+OpenMP hybrid from Makefile)
+        MPI_OUTPUT=$(srun -n "$mpi" --cpus-per-task=$OMP_THREADS_PER_TASK ./stencil_parallel -x "$X_SIZE" -y "$Y_SIZE" -n $ITERATIONS -e $NSOURCES -E $ENERGY_PER_SOURCE $PERIODIC_FLAG)
+
+        # Parse comprehensive hybrid performance metrics
+        MPI_TOTAL=$(echo "$MPI_OUTPUT" | awk '/^Total time:/ {print $3}')
+        MPI_INIT=$(echo "$MPI_OUTPUT" | awk '/^Initialization time:/ {print $3}')
+        MPI_COMP=$(echo "$MPI_OUTPUT" | awk '/^Computation time:/ {print $3}')
+        MPI_COMM=$(echo "$MPI_OUTPUT" | awk '/^Communication time:/ {print $3}')
+        MPI_COMM_RATIO=$(echo "$MPI_OUTPUT" | awk -F'[ %]' '/^Communication\/Total ratio:/ {print $3}')
+        MPI_COMP_RATIO=$(echo "$MPI_OUTPUT" | awk -F'[ %]' '/^Computation\/Total ratio:/ {print $3}')
+        MPI_WAIT=$(echo "$MPI_OUTPUT" | awk '/^Wait time for communication:/ {print $5}')
+        MPI_OVER_S=$(echo "$MPI_OUTPUT" | awk '/^Other time \(overhead\):/ {print $4}')
+        MPI_OVER_PCT=$(echo "$MPI_OUTPUT" | awk -F'[()% ]+' '/^Other time \(overhead\):/ {print $6}')
+        LOAD_IMBALANCE=$(echo "$MPI_OUTPUT" | awk '/Load imbalance/ {print $3}')
+        LOAD_BALANCE_EFF=$(echo "$MPI_OUTPUT" | awk '/^Load balance efficiency:/ {print $4}')
+        COMM_EFFICIENCY=$(echo "$MPI_OUTPUT" | awk '/^Communication efficiency:/ {print $3}')
+
+        # Parse max values across all MPI ranks for load balancing analysis
+        MPI_MAX_TOTAL=$(echo "$MPI_OUTPUT" | awk '/^Max total time:/ {print $4}')
+        MPI_MAX_COMP=$(echo "$MPI_OUTPUT" | awk '/^Max computation time:/ {print $4}')
+        MPI_MAX_COMM=$(echo "$MPI_OUTPUT" | awk '/^Max communication time:/ {print $4}')
+        MPI_MAX_WAIT=$(echo "$MPI_OUTPUT" | awk '/^Max wait time for communication:/ {print $6}')
+
+        # Validate that all critical metrics were successfully parsed
+        if [[ -z "${MPI_TOTAL:-}" || -z "${MPI_INIT:-}" || -z "${MPI_COMP:-}" || -z "${MPI_COMM:-}" || -z "${MPI_COMM_RATIO:-}" || -z "${MPI_COMP_RATIO:-}" || -z "${MPI_WAIT:-}" || -z "${MPI_OVER_S:-}" || -z "${MPI_OVER_PCT:-}" || -z "${LOAD_IMBALANCE:-}" || -z "${LOAD_BALANCE_EFF:-}" || -z "${COMM_EFFICIENCY:-}" ]]; then
+            echo "Error: Standard hybrid run failed to produce valid performance metrics for $mpi task(s)." >&2
+            echo "Program output:"
+            echo "$MPI_OUTPUT"
+            continue
+        fi
+
+        # Establish baseline time from single-task execution (mpi=1, 8 threads)
+        if [ "$mpi" -eq 1 ]; then
+            HYBRID_SERIAL_TIME=$MPI_TOTAL
+            echo "Baseline time for Standard Hybrid (1 task, 8 threads): $HYBRID_SERIAL_TIME s"
+        fi
+
+        # Weak scaling efficiency = Time(1 unit) / Time(N units)
+        # For hybrid: 1 unit = 1 MPI task × 8 OpenMP threads
+        EFFICIENCY=$(echo "scale=4; $HYBRID_SERIAL_TIME / $MPI_TOTAL" | bc)
+
+        # Display comprehensive hybrid weak scaling performance analysis
+        echo "Standard Hybrid Configuration: $mpi tasks × $OMP_THREADS_PER_TASK threads = $TOTAL_CORES cores, problem size: $PROBLEM_SIZE"
+        echo "  Performance breakdown:"
+        echo "    Init:      $MPI_INIT s"
+        echo "    Compute:   $MPI_COMP s ($MPI_COMP_RATIO%)"
+        echo "    Comm:      $MPI_COMM s ($MPI_COMM_RATIO%)"
+        echo "    Wait:      $MPI_WAIT s"
+        echo "    Overhead:  $MPI_OVER_S s (${MPI_OVER_PCT:-N/A}%)"
+        echo "    Total:     $MPI_TOTAL s"
+        echo "  Max values across ranks:"
+        echo "    Max Total:   $MPI_MAX_TOTAL s"
+        echo "    Max Compute: $MPI_MAX_COMP s"
+        echo "    Max Comm:    $MPI_MAX_COMM s"
+        echo "    Max Wait:    $MPI_MAX_WAIT s"
+        echo "  Weak scaling metrics:"
+        echo "    Efficiency: $(echo "scale=2; $EFFICIENCY * 100" | bc)% (ideal = 100%)"
+        echo "    Load imbalance: $LOAD_IMBALANCE"
+        echo "    Load balance efficiency: $LOAD_BALANCE_EFF"
+        echo "    Communication efficiency: $COMM_EFFICIENCY"
+        echo "---------------------------------------------------"
+        
+        # Record comprehensive results to CSV file for analysis
+        echo "$run,$mpi,$OMP_THREADS_PER_TASK,$PROBLEM_SIZE,$MPI_TOTAL,$MPI_INIT,$MPI_COMP,$MPI_COMM,$MPI_WAIT,$MPI_OVER_S,$EFFICIENCY,$LOAD_IMBALANCE,$LOAD_BALANCE_EFF,$COMM_EFFICIENCY" >> "$MPI_HYBRID_CSV"
+    done
+
+    echo "---------------------------------------------------"
+    echo "Benchmarking MPI+OPENMP OPTIMIZED version (Communication Overlap) - Run #$run"
+    echo "---------------------------------------------------"
+
+    # Optimized MPI+OpenMP hybrid baseline time tracking for weak scaling efficiency calculations
+    HYBRID_V2_SERIAL_TIME="" # Initialize baseline time for this block
+    for mpi in "${MPI_LIST[@]}"; do
+        export OMP_NUM_THREADS=$OMP_THREADS_PER_TASK   # Fixed 8 OpenMP threads per MPI task
+
+        TOTAL_CORES=$((mpi * OMP_THREADS_PER_TASK))
+        # Scale side length by sqrt(total_cores) to keep area proportional
+        NEW_SIDE=$(echo "sqrt($TOTAL_CORES) * $BASE_SIDE_LEN" | bc -l)
+        X_SIZE=$(printf "%.0f" "$NEW_SIDE")
+        Y_SIZE=$X_SIZE
+        PROBLEM_SIZE="${X_SIZE}x${Y_SIZE}"
+        echo "Testing Optimized Hybrid with $mpi tasks ($TOTAL_CORES total cores) on a $PROBLEM_SIZE grid..."
+
+        # Execute optimized hybrid version with SLURM resource allocation  
+        # Uses stencil_parallel_2 (optimized MPI+OpenMP with communication-computation overlap)
+        MPI_OUTPUT=$(srun -n "$mpi" --cpus-per-task=$OMP_THREADS_PER_TASK ./stencil_parallel_2 -x "$X_SIZE" -y "$Y_SIZE" -n $ITERATIONS -e $NSOURCES -E $ENERGY_PER_SOURCE $PERIODIC_FLAG)
+
+        # Parse comprehensive optimized hybrid performance metrics
+        MPI_TOTAL=$(echo "$MPI_OUTPUT" | awk '/^Total time:/ {print $3}')
+        MPI_INIT=$(echo "$MPI_OUTPUT" | awk '/^Initialization time:/ {print $3}')
+        MPI_COMP=$(echo "$MPI_OUTPUT" | awk '/^Computation time:/ {print $3}')
+        MPI_COMM=$(echo "$MPI_OUTPUT" | awk '/^Communication time:/ {print $3}')
+        MPI_COMM_RATIO=$(echo "$MPI_OUTPUT" | awk -F'[ %]' '/^Communication\/Total ratio:/ {print $3}')
+        MPI_COMP_RATIO=$(echo "$MPI_OUTPUT" | awk -F'[ %]' '/^Computation\/Total ratio:/ {print $3}')
+        MPI_WAIT=$(echo "$MPI_OUTPUT" | awk '/^Wait time for communication:/ {print $5}')
+        MPI_OVER_S=$(echo "$MPI_OUTPUT" | awk '/^Other time \(overhead\):/ {print $4}')
+        MPI_OVER_PCT=$(echo "$MPI_OUTPUT" | awk -F'[()% ]+' '/^Other time \(overhead\):/ {print $6}')
+        LOAD_IMBALANCE=$(echo "$MPI_OUTPUT" | awk '/Load imbalance/ {print $3}')
+        LOAD_BALANCE_EFF=$(echo "$MPI_OUTPUT" | awk '/^Load balance efficiency:/ {print $4}')
+        COMM_EFFICIENCY=$(echo "$MPI_OUTPUT" | awk '/^Communication efficiency:/ {print $3}')
+
+        # Parse max values across all MPI ranks for load balancing analysis
+        MPI_MAX_TOTAL=$(echo "$MPI_OUTPUT" | awk '/^Max total time:/ {print $4}')
+        MPI_MAX_COMP=$(echo "$MPI_OUTPUT" | awk '/^Max computation time:/ {print $4}')
+        MPI_MAX_COMM=$(echo "$MPI_OUTPUT" | awk '/^Max communication time:/ {print $4}')
+        MPI_MAX_WAIT=$(echo "$MPI_OUTPUT" | awk '/^Max wait time for communication:/ {print $6}')
+
+        # Validate that all critical metrics were successfully parsed
+        if [[ -z "${MPI_TOTAL:-}" || -z "${MPI_INIT:-}" || -z "${MPI_COMP:-}" || -z "${MPI_COMM:-}" || -z "${MPI_COMM_RATIO:-}" || -z "${MPI_COMP_RATIO:-}" || -z "${MPI_WAIT:-}" || -z "${MPI_OVER_S:-}" || -z "${MPI_OVER_PCT:-}" || -z "${LOAD_IMBALANCE:-}" || -z "${LOAD_BALANCE_EFF:-}" || -z "${COMM_EFFICIENCY:-}" ]]; then
+            echo "Error: Optimized hybrid run failed to produce valid performance metrics for $mpi task(s)." >&2
+            echo "Program output:"
+            echo "$MPI_OUTPUT"
+            continue
+        fi
+
+        # Establish baseline time from single-task execution (mpi=1, 8 threads)
+        if [ "$mpi" -eq 1 ]; then
+            HYBRID_V2_SERIAL_TIME=$MPI_TOTAL
+            echo "Baseline time for Optimized Hybrid (1 task, 8 threads): $HYBRID_V2_SERIAL_TIME s"
+        fi
+
+        # Weak scaling efficiency = Time(1 unit) / Time(N units)
+        # For optimized hybrid: 1 unit = 1 MPI task × 8 OpenMP threads
+        EFFICIENCY=$(echo "scale=4; $HYBRID_V2_SERIAL_TIME / $MPI_TOTAL" | bc)
+
+        # Display comprehensive optimized hybrid weak scaling performance analysis
+        echo "Optimized Hybrid Configuration: $mpi tasks × $OMP_THREADS_PER_TASK threads = $TOTAL_CORES cores, problem size: $PROBLEM_SIZE"
+        echo "  Performance breakdown:"
+        echo "    Init:      $MPI_INIT s"
+        echo "    Compute:   $MPI_COMP s ($MPI_COMP_RATIO%)"
+        echo "    Comm:      $MPI_COMM s ($MPI_COMM_RATIO%)"
+        echo "    Wait:      $MPI_WAIT s"
+        echo "    Overhead:  $MPI_OVER_S s (${MPI_OVER_PCT:-N/A}%)"
+        echo "    Total:     $MPI_TOTAL s"
+        echo "  Max values across ranks:"
+        echo "    Max Total:   $MPI_MAX_TOTAL s"
+        echo "    Max Compute: $MPI_MAX_COMP s"
+        echo "    Max Comm:    $MPI_MAX_COMM s"
+        echo "    Max Wait:    $MPI_MAX_WAIT s"
+        echo "  Optimized hybrid weak scaling metrics:"
+        echo "    Efficiency: $(echo "scale=2; $EFFICIENCY * 100" | bc)% (ideal = 100%)"
+        echo "    Load imbalance: $LOAD_IMBALANCE"
+        echo "    Load balance efficiency: $LOAD_BALANCE_EFF"
+        echo "    Communication efficiency: $COMM_EFFICIENCY"
+        echo "---------------------------------------------------"
+
+        # Record comprehensive results to CSV file for analysis
+        echo "$run,$mpi,$OMP_THREADS_PER_TASK,$PROBLEM_SIZE,$MPI_TOTAL,$MPI_INIT,$MPI_COMP,$MPI_COMM,$MPI_WAIT,$MPI_OVER_S,$EFFICIENCY,$LOAD_IMBALANCE,$LOAD_BALANCE_EFF,$COMM_EFFICIENCY" >> "$MPI_HYBRID_V2_CSV"
+    done
+done
+
+echo "==================================================="
+echo "WEAK SCALING BENCHMARK COMPLETED SUCCESSFULLY"
+echo "==================================================="
+echo "All benchmark executions completed successfully."
+echo ""
+echo "RESULTS SUMMARY:"
+echo "  Total configurations tested: $((${#THREADS_LIST[@]} + ${#MPI_LIST_PURE[@]} + 2 * ${#MPI_LIST[@]}))"
+echo "  Total benchmark runs executed: $((NUM_RUNS * (${#THREADS_LIST[@]} + ${#MPI_LIST_PURE[@]} + 2 * ${#MPI_LIST[@]})))"
+echo "  OpenMP configurations: ${#THREADS_LIST[@]} (threads: ${THREADS_LIST[*]})"
+echo "  MPI-only configurations: ${#MPI_LIST_PURE[@]} (tasks: ${MPI_LIST_PURE[*]})"
+echo "  Standard hybrid configurations: ${#MPI_LIST[@]} (tasks: ${MPI_LIST[*]}, ${OMP_THREADS_PER_TASK} threads each)"
+echo "  Optimized hybrid configurations: ${#MPI_LIST[@]} (tasks: ${MPI_LIST[*]}, ${OMP_THREADS_PER_TASK} threads each)"
+echo ""
+echo "PROBLEM SIZES TESTED:"
+echo "  Base problem: ${BASE_SIDE_LEN} × ${BASE_SIDE_LEN} (1 core baseline)"
+echo "  Scaling formula: Grid_Size = Base_Size × √(Cores)"
+echo "  Largest problem: $(printf "%.0f" "$(echo "sqrt(128) * $BASE_SIDE_LEN" | bc -l)") × $(printf "%.0f" "$(echo "sqrt(128) * $BASE_SIDE_LEN" | bc -l)") (128 cores)"
+echo ""
+echo "OUTPUT FILES GENERATED:"
+echo "  ✓ OpenMP weak scaling results:           $OMP_CSV"
+echo "  ✓ MPI-only weak scaling results:         $MPI_PURE_CSV"
+echo "  ✓ Standard hybrid weak scaling results:  $MPI_HYBRID_CSV"
+echo "  ✓ Optimized hybrid weak scaling results: $MPI_HYBRID_V2_CSV"
+echo ""
+echo "WEAK SCALING ANALYSIS RECOMMENDATIONS:"
+echo "  1. Plot weak scaling efficiency vs core count (ideal = 100%)"
+echo "  2. Analyze efficiency degradation patterns across implementations"
+echo "  3. Examine communication overhead growth with problem size"
+echo "  4. Compare communication-computation overlap benefits at scale"
+echo "  5. Evaluate memory hierarchy effects on larger problems"
+echo "  6. Assess load balancing effectiveness across problem sizes"
+echo "  7. Identify optimal core counts for each implementation"
+echo ""
+echo "KEY WEAK SCALING INSIGHTS TO LOOK FOR:"
+echo "  - Efficiency close to 100% indicates good weak scalability"
+echo "  - Declining efficiency reveals algorithmic or implementation limits"
+echo "  - Communication ratio increase shows network/protocol bottlenecks"
+echo "  - Load imbalance growth indicates partitioning issues"
+echo "  - Optimized version should show better efficiency at higher core counts"
+echo ""
+echo "NEXT STEPS:"
+echo "  - Import CSV files into analysis tools (Python, R, Excel)"
+echo "  - Generate weak scaling efficiency plots vs core count"
+echo "  - Compare communication overhead scaling between versions 1 and 2"
+echo "  - Analyze memory bandwidth effects on large problem sizes"
+echo "  - Determine optimal deployment strategies for production runs"
+echo "==================================================="
