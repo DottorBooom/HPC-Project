@@ -10,7 +10,7 @@ This repository contains comprehensive solutions for the **High Performance Comp
 4. [Build System](#-build-system)
 5. [Execution Guide](#-execution-guide)
 6. [Performance Analysis](#-performance-analysis)
-7. [Cluster Execution (SLURM)](#c-luster-execution-slurm)
+7. [Cluster Execution (SLURM)](#%EF%B8%8F-cluster-execution-slurm)
 8. [Expected Results](#-expected-results)
 9. [Technical Details](#-technical-details)
 10. [Requirements](#-requirements)
